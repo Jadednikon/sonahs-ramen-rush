@@ -434,18 +434,28 @@ const CONFIG = {
     size: 5, duration: 60, testDuration: 20, tick: 0.6,
     queueBase: 6, queueMax: 10,   // blocks you can line up at once = queueBase + chips owned (up to queueMax)
     playerBase: [0,4], rivalBase: [4,0],
-    bowlSpots: [[0,1],[2,2],[3,4]],   // starting spots; a scored bowl comes back on a random empty square
     wheels: [0, 1, 1.5, 2],       // tiles per tick by level
     claw:   [0, 1, 2, 3],         // bowls carried at once by level
     helmetBlock: [0, 0.5, 0.75, 1],  // chance a steal is blocked
     boostTime: [0, 3, 4, 5],      // seconds of double speed
     stealCooldown: 3,             // ticks
     respawnTicks: 4,              // a scored bowl stays in the base pile; a fresh one appears at its spot after this many ticks
+    // each rival has a personality and its own map: walls block, puddles make a robot slip and lose a turn
     rivals: [
-      { name:'Team Bolt',     speed:0.6,  cap:1, color:'#FF9A62' },
-      { name:'Team Sprocket', speed:0.75, cap:1, color:'#E5484D' },
-      { name:'Team Wasabi',   speed:0.9,  cap:2, color:'#7CCB6B' }
-    ]
+      { name:'Team Bolt', speed:0.55, cap:1, color:'#FF9A62',
+        tagline:'Slow and steady. Bolt only ever goes for the closest bowl.',
+        tip:'Grab the bowls near your BASE first, then race for the middle.',
+        walls:[[2,1],[2,3]], puddles:[[1,2],[3,2]], bowls:[[0,1],[2,2],[3,4]] },
+      { name:'Team Sprocket', speed:0.75, cap:1, color:'#E5484D', steals:true,
+        tagline:'A sneaky thief! Sprocket chases you when you carry a bowl and steals it on a bump.',
+        tip:'Take routes away from Sprocket, or upgrade your Bowl Helmet to block steals.',
+        walls:[[1,1],[3,3],[1,3]], puddles:[[2,2],[3,1]], bowls:[[0,1],[2,4],[3,2]] },
+      { name:'Team Wasabi', speed:0.85, cap:2, color:'#7CCB6B', raids:true,
+        tagline:'Fast and bold. When you are ahead, Wasabi drives to YOUR base and takes a bowl back.',
+        tip:'Park Noodle-Bot on your BASE to guard it when Wasabi comes for it.',
+        walls:[[1,1],[3,1],[1,3],[3,3]], puddles:[[2,2],[0,2],[4,2]], bowls:[[2,1],[1,2],[2,3]] }
+    ],
+    raidCooldown: 8,              // rival steps before Wasabi can raid again
   },
   blocks: {
     fwd1:   { label:'Forward 1', cls:'move' },
@@ -1059,7 +1069,8 @@ function openGarage() {
     if (save.parts[up.part] < up.cost || u[k] >= up.max) return;
     save.parts[up.part] -= up.cost; u[k]++; writeSave(); SFX.power(); toast(`${up.name} Lv ${u[k]}!`); openGarage();
   });
-  $('garQueueInfo').innerHTML = `You can line up <b>${queueCap()}</b> blocks at a time (6, plus 1 for each chip you own). Try a <b>Practice run</b> first: no rival, just you and the bowls.`;
+  $('garQueueInfo').innerHTML = `You can line up <b>${queueCap()}</b> blocks at a time (6, plus 1 for each chip you own). Try a <b>Practice run</b> first: no rival, same map as your next match.`
+    + (nextRumble() !== null ? `<br><br><b style="color:${CONFIG.arena.rivals[nextRumble()].color}">Next: ${CONFIG.arena.rivals[nextRumble()].name}.</b> ${CONFIG.arena.rivals[nextRumble()].tagline}` : '');
   const rv = nextRumble();
   $('garArena').disabled = rv === null;
   $('garArena').textContent = rv === null ? 'Arena locked' : 'To the Arena!';
@@ -1075,16 +1086,18 @@ $('garArena').onclick = () => { const r = nextRumble(); if (r !== null) startAre
 const arenaCv = $('arenaCanvas'), actx = arenaCv.getContext('2d');
 const A = {};
 const DIRS = [[0, -1], [1, 0], [0, 1], [-1, 0]]; // up right down left
-const LIVE_BLOCKS = ['fwd1', 'fwd2', 'fwd3', 'left', 'right', 'grab', 'drop'];
+const LIVE_BLOCKS = ['fwd1', 'fwd2', 'fwd3', 'left', 'right', 'grab', 'drop', 'repeat2'];
 function startArena(rivalIdx) {
   const a = CONFIG.arena, u = save.upgrades, test = rivalIdx === null;
+  const map = a.rivals[test ? (nextRumble() ?? 0) : rivalIdx];
   Object.assign(A, {
-    test, rivalIdx, running: true, paused: false, over: false,
+    test, rivalIdx, running: test, paused: false, over: false,
+    walls: map.walls, puddles: map.puddles,
     timeLeft: test ? a.testDuration : a.duration, tickT: 0,
     queue: [], qid: 0,
     p: { x: a.playerBase[0], y: a.playerBase[1], dir: 0, rx: a.playerBase[0], ry: a.playerBase[1], budget: 0, carry: 0, score: 0 },
-    r: test ? null : { x: a.rivalBase[0], y: a.rivalBase[1], rx: a.rivalBase[0], ry: a.rivalBase[1], budget: 0, carry: 0, score: 0, def: a.rivals[rivalIdx] },
-    bowls: a.bowlSpots.map(([x, y]) => ({ sx: x, sy: y, x, y, by: null })),
+    r: test ? null : { x: a.rivalBase[0], y: a.rivalBase[1], rx: a.rivalBase[0], ry: a.rivalBase[1], budget: 0, carry: 0, score: 0, stuck: 0, raidCD: 0, def: a.rivals[rivalIdx] },
+    bowls: map.bowls.map(([x, y]) => ({ sx: x, sy: y, x, y, by: null })),
     speed: a.wheels[u.wheels], cap: a.claw[u.claw], boost: 0, boostUsed: u.booster === 0,
     firstScorer: null, stealCD: 0, trail: [[a.playerBase[0], a.playerBase[1]]], fx: []
   });
@@ -1093,14 +1106,43 @@ function startArena(rivalIdx) {
   $('arBoost').disabled = A.boostUsed;
   $('arBoost').textContent = u.booster === 0 ? 'Boost: needs Spicy Booster' : 'Ramen Boost!';
   $('arBoost').style.fontSize = u.booster === 0 ? '14px' : '';
-  $('arPal').innerHTML = LIVE_BLOCKS.map(k => `<button class="blk ${CONFIG.blocks[k].cls}" data-k="${k}" aria-label="Add ${CONFIG.blocks[k].label}">${blockIcon(k)}${CONFIG.blocks[k].label}</button>`).join('')
+  $('arPal').innerHTML = LIVE_BLOCKS.map(k => blockUnlocked(k)
+      ? `<button class="blk ${CONFIG.blocks[k].cls}" data-k="${k}" aria-label="Add ${CONFIG.blocks[k].label}">${blockIcon(k)}${CONFIG.blocks[k].label}</button>`
+      : `<button class="blk locked" disabled>${svg('lock', 14)}${CONFIG.blocks[k].label} · after Rumble 1</button>`).join('')
     + `<button class="blk ctl" id="arUndo" aria-label="Remove last block">Undo</button><button class="blk ctl" id="arClear" aria-label="Clear the queue">Clear</button>`;
   $('arPal').querySelectorAll('button[data-k]').forEach(b => b.onclick = () => queueAdd(b.dataset.k));
   $('arUndo').onclick = () => { if (A.queue.length > 1 || (A.queue.length === 1 && !A.queue[0].started)) { A.queue.pop(); SFX.beep(); renderQueue(); } };
   $('arClear').onclick = () => { A.queue = A.queue.filter(q => q.started); SFX.beep(); renderQueue(); };
   show('arena'); renderQueue(); arenaHUD();
-  toast(test ? 'Tap blocks to drive!' : 'GO! Tap blocks to drive!', 1100);
+  if (test) { toast('Tap blocks to drive!', 1100); return; }
+  // pre-match card: meet the rival
+  $('arResIcon').innerHTML = `<div style="width:80px;height:80px;border-radius:18px;background:${map.color};display:flex;align-items:center;justify-content:center">${svg('rivalFace', 58)}</div>`;
+  $('arResTitle').textContent = 'vs ' + map.name;
+  $('arResText').innerHTML = `${map.tagline}<br><br><b>Tip:</b> ${map.tip}<br><br><span style="color:var(--muted)">Gray blocks are walls. Blue puddles make robots slip and lose a turn.</span>`;
+  $('arResMain').textContent = 'Start the Rumble!';
+  $('arResMain').onclick = () => { $('mArena').hidden = true; A.running = true; toast('GO! Tap blocks to drive!', 1000); };
+  $('arResAlt').textContent = 'Back to Garage';
+  $('arResAlt').onclick = () => { $('mArena').hidden = true; openGarage(); };
+  $('mArena').hidden = false;
 }
+const isWall = (x, y) => A.walls.some(([wx, wy]) => wx === x && wy === y);
+const isPuddle = (x, y) => A.puddles.some(([wx, wy]) => wx === x && wy === y);
+const canEnter = (x, y) => inB(x, y) && !isWall(x, y);
+// shortest-path next step around walls (breadth-first search)
+function nextStep(fx, fy, tx, ty) {
+  if (fx === tx && fy === ty) return null;
+  const key = (x, y) => x + ',' + y, prev = { [key(fx, fy)]: null }, q = [[fx, fy]];
+  while (q.length) {
+    const [x, y] = q.shift();
+    if (x === tx && y === ty) break;
+    for (const [dx, dy] of DIRS) { const nx = x + dx, ny = y + dy; if (canEnter(nx, ny) && !(key(nx, ny) in prev)) { prev[key(nx, ny)] = [x, y]; q.push([nx, ny]); } }
+  }
+  if (!(key(tx, ty) in prev)) return null;
+  let cur = [tx, ty];
+  while (prev[key(...cur)] && !(prev[key(...cur)][0] === fx && prev[key(...cur)][1] === fy)) cur = prev[key(...cur)];
+  return cur;
+}
+const pathLen = (fx, fy, tx, ty) => { let n = 0, x = fx, y = fy; while (n < 30) { const s2 = nextStep(x, y, tx, ty); if (!s2) return x === tx && y === ty ? n : 99; [x, y] = s2; n++; } return 99; };
 function queueAdd(k) {
   if (!A.running) return;
   const cap = queueCap();
@@ -1121,14 +1163,14 @@ const inB = (x, y) => x >= 0 && y >= 0 && x < CONFIG.arena.size && y < CONFIG.ar
 const atBase = (o, base) => o.x === base[0] && o.y === base[1];
 function bowlsAt(x, y) { return A.bowls.filter(b => !b.by && b.x === x && b.y === y); }
 function carried(who) { return A.bowls.filter(b => b.by === who); }
-function respawn(b) { b.by = 'scored'; b.wait = CONFIG.arena.respawnTicks; }   // off the board until a fresh bowl appears
+function respawn(b) { if (b.temp) { b.by = 'gone'; return; } b.by = 'scored'; b.wait = CONFIG.arena.respawnTicks; }   // off the board until a fresh bowl appears
 function tickRespawns() {
   const a = CONFIG.arena;
   for (const b of A.bowls) if (b.by === 'scored' && --b.wait <= 0) {
     // new bowl on a random empty square (not a base, not under a robot, not on another bowl)
     const free = [];
     for (let y = 0; y < a.size; y++) for (let x = 0; x < a.size; x++) {
-      const taken = (x === a.playerBase[0] && y === a.playerBase[1]) || (x === a.rivalBase[0] && y === a.rivalBase[1])
+      const taken = isWall(x, y) || isPuddle(x, y) || (x === a.playerBase[0] && y === a.playerBase[1]) || (x === a.rivalBase[0] && y === a.rivalBase[1])
         || (x === A.p.x && y === A.p.y) || (A.r && x === A.r.x && y === A.r.y) || bowlsAt(x, y).length;
       if (!taken) free.push([x, y]);
     }
@@ -1138,6 +1180,13 @@ function tickRespawns() {
 }
 function afx(x, y, text, color) { A.fx.push({ x, y, text, color, t: 0 }); }
 function playerOp() {
+  // Repeat ×2 doubles the block right after it (waits until that block is added)
+  while (A.queue[0] && A.queue[0].k === 'repeat2') {
+    const n = A.queue[1]; if (!n) return;
+    A.queue.shift();
+    A.queue.splice(1, 0, { k: n.k, left: n.k.startsWith('fwd') ? +n.k.slice(3) : 1, id: ++A.qid, started: false });
+    afx(A.p.x, A.p.y, 'REPEAT ×2', '#7CCB6B');
+  }
   const q = A.queue[0];
   if (!q) return;
   q.started = true;
@@ -1145,8 +1194,11 @@ function playerOp() {
   SFX.beep();
   if (op === 'move') {
     const [dx, dy] = DIRS[p.dir], nx = p.x + dx, ny = p.y + dy;
-    if (inB(nx, ny)) { p.x = nx; p.y = ny; A.trail.push([nx, ny]); if (A.trail.length > 40) A.trail.shift(); }
-    else { afx(p.x, p.y, 'BONK', '#C9CCE6'); SFX.bump(); q.left = 1; }   // hit a wall: skip the rest of this Forward
+    if (canEnter(nx, ny)) {
+      p.x = nx; p.y = ny;
+      if (isPuddle(nx, ny)) { p.stuck = 1; q.left = 1; afx(nx, ny, 'SPLASH! slip', '#7CC4FF'); SFX.bump(); }
+    }
+    else { afx(p.x, p.y, 'BONK', '#C9CCE6'); SFX.bump(); q.left = 1; }   // hit a wall or edge: skip the rest of this Forward
   } else if (op === 'left') p.dir = (p.dir + 3) % 4;
   else if (op === 'right') p.dir = (p.dir + 1) % 4;
   else if (op === 'grab') {
@@ -1165,35 +1217,56 @@ function playerOp() {
 }
 // where the queued moves will take Noodle-Bot (drawn as a dotted preview)
 function previewPath() {
-  let { x, y, dir } = A.p; const pts = [[x, y]];
+  let { x, y, dir } = A.p; const pts = [[x, y]]; let times = 1;
   for (const q of A.queue) {
-    if (q.k === 'left') dir = (dir + 3) % 4;
-    else if (q.k === 'right') dir = (dir + 1) % 4;
-    else if (q.k.startsWith('fwd')) for (let n = 0; n < q.left; n++) { const nx = x + DIRS[dir][0], ny = y + DIRS[dir][1]; if (!inB(nx, ny)) break; x = nx; y = ny; pts.push([x, y]); }
+    if (q.k === 'repeat2') { times = 2; continue; }
+    for (let t = 0; t < times; t++) {
+      if (q.k === 'left') dir = (dir + 3) % 4;
+      else if (q.k === 'right') dir = (dir + 1) % 4;
+      else if (q.k.startsWith('fwd')) { const steps = t === 0 ? q.left : +q.k.slice(3); for (let n = 0; n < steps; n++) { const nx = x + DIRS[dir][0], ny = y + DIRS[dir][1]; if (!canEnter(nx, ny)) break; x = nx; y = ny; pts.push([x, y]); if (isPuddle(x, y)) break; } }
+    }
+    times = 1;
   }
   return { pts, dir, x, y };
 }
 function rivalStep() {
-  const r = A.r, a = CONFIG.arena, mine = carried('r');
+  const r = A.r, a = CONFIG.arena, d = r.def, mine = carried('r'), p = A.p;
+  r.raidCD = Math.max(0, r.raidCD - 1);
   const free = A.bowls.filter(b => !b.by);
-  if (mine.length < r.def.cap && free.length) {
+  let target = null;
+  if (mine.length && (mine.length >= d.cap || !free.length)) {
+    // carry home and score
+    if (atBase(r, a.rivalBase)) { r.score += mine.length; if (!A.firstScorer) A.firstScorer = 'r'; mine.forEach(respawn); afx(r.x, r.y, `+${mine.length}`, d.color); A.flashR = 1; return; }
+    target = a.rivalBase;
+  } else if (d.raids && !mine.length && r.raidCD === 0 && p.score >= r.score + 1) {
+    // Wasabi: raid the player's base when the player is ahead
+    if (atBase(r, a.playerBase)) {
+      r.raidCD = a.raidCooldown;
+      if (atBase(p, a.playerBase)) { afx(r.x, r.y, 'GUARDED!', '#7FD1E8'); SFX.bump(); }
+      else { p.score--; A.bowls.push({ temp: true, sx: r.x, sy: r.y, x: r.x, y: r.y, by: 'r' }); afx(r.x, r.y, 'RAIDED!', d.color); SFX.hit(); }
+      return;
+    }
+    target = a.playerBase;
+  } else if (d.steals && carried('p').length && mine.length < d.cap) {
+    target = [p.x, p.y];   // Sprocket: chase the bowl carrier
+  } else if (mine.length < d.cap && free.length) {
     const here = bowlsAt(r.x, r.y);
     if (here.length) { here[0].by = 'r'; return; }
-    free.sort((b1, b2) => (Math.abs(b1.x - r.x) + Math.abs(b1.y - r.y)) - (Math.abs(b2.x - r.x) + Math.abs(b2.y - r.y)));
-    stepToward(r, free[0].x, free[0].y);
-  } else if (mine.length) {
-    if (atBase(r, a.rivalBase)) { r.score += mine.length; if (!A.firstScorer) A.firstScorer = 'r'; mine.forEach(respawn); afx(r.x, r.y, `+${mine.length}`, r.def.color); A.flashR = 1; }
-    else stepToward(r, a.rivalBase[0], a.rivalBase[1]);
+    free.sort((b1, b2) => pathLen(r.x, r.y, b1.x, b1.y) - pathLen(r.x, r.y, b2.x, b2.y));
+    target = [free[0].x, free[0].y];
+  } else if (mine.length) target = a.rivalBase;
+  if (target) {
+    const st = nextStep(r.x, r.y, target[0], target[1]);
+    if (st) { r.x = st[0]; r.y = st[1]; if (isPuddle(r.x, r.y)) { r.stuck = 1; afx(r.x, r.y, 'SPLASH!', '#7CC4FF'); } }
   }
   checkBump();
 }
-function stepToward(o, tx, ty) { if (o.x !== tx) o.x += Math.sign(tx - o.x); else if (o.y !== ty) o.y += Math.sign(ty - o.y); }
 function checkBump() {
   const p = A.p, r = A.r;
   if (!r || A.stealCD > 0 || p.x !== r.x || p.y !== r.y) return;
   A.stealCD = CONFIG.arena.stealCooldown;
   const mine = carried('p');
-  if (!mine.length || carried('r').length >= r.def.cap) { afx(p.x, p.y, 'BUMP!', '#FFF4D6'); SFX.bump(); return; }
+  if (!r.def.steals || !mine.length || carried('r').length >= r.def.cap) { afx(p.x, p.y, 'BUMP!', '#FFF4D6'); SFX.bump(); return; }
   if (Math.random() < CONFIG.arena.helmetBlock[save.upgrades.helmet]) { afx(p.x, p.y, 'BLOCKED!', '#7FD1E8'); SFX.bump(); }
   else { mine[0].by = 'r'; afx(p.x, p.y, 'STOLEN!', r.def.color); SFX.hit(); }
 }
@@ -1204,8 +1277,8 @@ function arenaUpdate(dt) {
   while (A.tickT >= a.tick) {
     A.tickT -= a.tick; A.stealCD = Math.max(0, A.stealCD - 1); tickRespawns();
     A.p.budget += A.speed * (A.boost > 0 ? 2 : 1);
-    while (A.p.budget >= 1) { A.p.budget -= 1; playerOp(); }
-    if (A.r) { A.r.budget += A.r.def.speed; while (A.r.budget >= 1) { A.r.budget -= 1; rivalStep(); } }
+    while (A.p.budget >= 1) { A.p.budget -= 1; if (A.p.stuck > 0) { A.p.stuck--; continue; } playerOp(); }
+    if (A.r) { A.r.budget += A.r.def.speed; while (A.r.budget >= 1) { A.r.budget -= 1; if (A.r.stuck > 0) { A.r.stuck--; continue; } rivalStep(); } }
   }
   for (const o of [A.p, A.r]) if (o) { const k = Math.min(1, dt * 12); o.rx += (o.x - o.rx) * k; o.ry += (o.y - o.ry) * k; }
   for (const f of A.fx) f.t += dt; A.fx = A.fx.filter(f => f.t < 1);
@@ -1223,6 +1296,17 @@ function arenaDraw() {
     ctx.setLineDash([6, 5]); ctx.strokeStyle = col; ctx.lineWidth = 3; ctx.beginPath(); ctx.roundRect(x * C + 4, y * C + 4, C - 8, C - 8, 10); ctx.stroke(); ctx.setLineDash([]);
     ctx.fillStyle = col; ctx.font = "800 11px 'Nunito', sans-serif"; ctx.textAlign = 'center'; ctx.fillText(label, x * C + C / 2, y * C + (y === 0 ? 14 : C - 6));
   };
+  for (const [x, y] of A.puddles) {
+    ctx.fillStyle = 'rgba(62,123,224,.55)'; ctx.beginPath(); ctx.ellipse(x * C + C / 2, y * C + C / 2 + 4, 26, 16, 0, 0, 7); ctx.fill();
+    ctx.strokeStyle = 'rgba(124,196,255,.8)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.ellipse(x * C + C / 2 - 6, y * C + C / 2, 8, 4, 0, 0, 7); ctx.stroke();
+  }
+  for (const [x, y] of A.walls) {
+    ctx.fillStyle = '#4A5080'; ctx.beginPath(); ctx.roundRect(x * C + 3, y * C + 3, C - 6, C - 6, 8); ctx.fill();
+    ctx.strokeStyle = '#2E3360'; ctx.lineWidth = 2; ctx.beginPath();
+    for (let r2 = 1; r2 < 4; r2++) { ctx.moveTo(x * C + 5, y * C + r2 * 16); ctx.lineTo(x * C + C - 5, y * C + r2 * 16); }
+    for (let r2 = 0; r2 < 4; r2++) { const off = r2 % 2 ? 22 : 34; ctx.moveTo(x * C + off, y * C + r2 * 16 + 4); ctx.lineTo(x * C + off, y * C + r2 * 16 + 16); }
+    ctx.stroke();
+  }
   base(a.playerBase, '#7FD1E8', 'BASE'); if (A.r) base(a.rivalBase, A.r.def.color, 'BASE');
   // scored bowls pile up in each base, so you can see they were delivered
   const pile = ([x, y], n, flash, col) => {
@@ -1244,7 +1328,6 @@ function arenaDraw() {
   }
   // empty spot markers + bowls
   for (const b of A.bowls) {
-    ctx.strokeStyle = 'rgba(232,128,58,.35)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(b.sx * C + C / 2, b.sy * C + C / 2, 20, 0, 7); ctx.stroke();
     if (!b.by) { const s = 44 * (1 + (b.pop || 0) * 0.4); ctx.drawImage(IMG.ramenSmall, b.x * C + C / 2 - s / 2, b.y * C + C / 2 - s / 2, s, s); }
   }
   const bot = (o, col, face, carry) => {
