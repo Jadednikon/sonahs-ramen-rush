@@ -299,6 +299,7 @@ body{margin:0}
   <div class="row"><span class="label">PROGRAM · tap blocks to add, tap again to remove</span><span class="slots" id="garSlots">0/8</span></div>
   <div class="prog" id="garProg"></div>
   <div class="palette" id="garPal"></div>
+  <span class="hint"><b style="color:var(--noodle)">Goal:</b> Grab a ramen bowl, drive it back to your BASE, then Drop it to score 1 point. Most points in 60s wins.</span>
   <div style="margin-top:auto;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px">
     <button class="btn secondary h56" id="garTest">Test run</button>
     <button class="btn primary h56" id="garArena">To the Arena!</button>
@@ -315,7 +316,7 @@ body{margin:0}
   </div>
   <canvas id="arenaCanvas" width="340" height="340" aria-label="Robot Rumble arena"></canvas>
   <div class="prog" style="flex-direction:column;align-items:stretch;gap:8px">
-    <span class="label">RUNNING YOUR PROGRAM</span>
+    <span class="label">RUNNING YOUR PROGRAM · Grab → back to BASE → Drop = 1 point</span>
     <div style="display:flex;flex-wrap:wrap;gap:6px" id="arProg"></div>
   </div>
   <div style="margin-top:auto;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px">
@@ -431,6 +432,7 @@ const CONFIG = {
     helmetBlock: [0, 0.5, 0.75, 1],  // chance a steal is blocked
     boostTime: [0, 3, 4, 5],      // seconds of double speed
     stealCooldown: 3,             // ticks
+    respawnTicks: 4,              // a scored bowl stays in the base pile; a fresh one appears at its spot after this many ticks
     rivals: [
       { name:'Team Bolt',     speed:0.6,  cap:1, color:'#FF9A62' },
       { name:'Team Sprocket', speed:0.75, cap:1, color:'#E5484D' },
@@ -1119,7 +1121,10 @@ const inB = (x, y) => x >= 0 && y >= 0 && x < CONFIG.arena.size && y < CONFIG.ar
 const atBase = (o, base) => o.x === base[0] && o.y === base[1];
 function bowlsAt(x, y) { return A.bowls.filter(b => !b.by && b.x === x && b.y === y); }
 function carried(who) { return A.bowls.filter(b => b.by === who); }
-function respawn(b) { b.by = null; b.x = b.sx; b.y = b.sy; }
+function respawn(b) { b.by = 'scored'; b.wait = CONFIG.arena.respawnTicks; }   // off the board until a fresh bowl appears
+function tickRespawns() {
+  for (const b of A.bowls) if (b.by === 'scored' && --b.wait <= 0) { b.by = null; b.x = b.sx; b.y = b.sy; b.pop = 1; afx(b.sx, b.sy, 'NEW BOWL', '#E8803A'); }
+}
 function afx(x, y, text, color) { A.fx.push({ x, y, text, color, t: 0 }); }
 function playerOp() {
   if (!A.ops.length) return;
@@ -1138,7 +1143,7 @@ function playerOp() {
   } else if (o.op === 'drop') {
     const mine = carried('p');
     if (!mine.length) afx(p.x, p.y, 'EMPTY', '#C9CCE6');
-    else if (atBase(p, a.playerBase)) { p.score += mine.length; if (!A.firstScorer) A.firstScorer = 'p'; mine.forEach(respawn); afx(p.x, p.y, '+' + mine.length, '#7FD1E8'); SFX.score(); }
+    else if (atBase(p, a.playerBase)) { p.score += mine.length; if (!A.firstScorer) A.firstScorer = 'p'; mine.forEach(respawn); afx(p.x, p.y, `SCORED +${mine.length}!`, '#7FD1E8'); A.flashP = 1; SFX.score(); }
     else { mine.forEach(b => { b.by = null; b.x = p.x; b.y = p.y; }); afx(p.x, p.y, 'DROPPED', '#C9CCE6'); }
   }
   checkBump();
@@ -1152,7 +1157,7 @@ function rivalStep() {
     free.sort((b1, b2) => (Math.abs(b1.x - r.x) + Math.abs(b1.y - r.y)) - (Math.abs(b2.x - r.x) + Math.abs(b2.y - r.y)));
     stepToward(r, free[0].x, free[0].y);
   } else if (mine.length) {
-    if (atBase(r, a.rivalBase)) { r.score += mine.length; if (!A.firstScorer) A.firstScorer = 'r'; mine.forEach(respawn); afx(r.x, r.y, '+' + mine.length, r.def.color); }
+    if (atBase(r, a.rivalBase)) { r.score += mine.length; if (!A.firstScorer) A.firstScorer = 'r'; mine.forEach(respawn); afx(r.x, r.y, `+${mine.length}`, r.def.color); A.flashR = 1; }
     else stepToward(r, a.rivalBase[0], a.rivalBase[1]);
   }
   checkBump();
@@ -1172,13 +1177,15 @@ function arenaUpdate(dt) {
   A.timeLeft -= dt; A.boost = Math.max(0, A.boost - dt);
   A.tickT += dt;
   while (A.tickT >= a.tick) {
-    A.tickT -= a.tick; A.stealCD = Math.max(0, A.stealCD - 1);
+    A.tickT -= a.tick; A.stealCD = Math.max(0, A.stealCD - 1); tickRespawns();
     A.p.budget += A.speed * (A.boost > 0 ? 2 : 1);
     while (A.p.budget >= 1) { A.p.budget -= 1; playerOp(); }
     if (A.r) { A.r.budget += A.r.def.speed; while (A.r.budget >= 1) { A.r.budget -= 1; rivalStep(); } }
   }
   for (const o of [A.p, A.r]) if (o) { const k = Math.min(1, dt * 12); o.rx += (o.x - o.rx) * k; o.ry += (o.y - o.ry) * k; }
   for (const f of A.fx) f.t += dt; A.fx = A.fx.filter(f => f.t < 1);
+  A.flashP = Math.max(0, (A.flashP || 0) - dt * 1.5); A.flashR = Math.max(0, (A.flashR || 0) - dt * 1.5);
+  for (const b of A.bowls) if (b.pop) b.pop = Math.max(0, b.pop - dt * 3);
   arenaHUD();
   if (A.timeLeft <= 0) endArena();
 }
@@ -1192,6 +1199,13 @@ function arenaDraw() {
     ctx.fillStyle = col; ctx.font = "800 11px 'Nunito', sans-serif"; ctx.textAlign = 'center'; ctx.fillText(label, x * C + C / 2, y * C + (y === 0 ? 14 : C - 6));
   };
   base(a.playerBase, '#7FD1E8', 'BASE'); if (A.r) base(a.rivalBase, A.r.def.color, 'BASE');
+  // scored bowls pile up in each base, so you can see they were delivered
+  const pile = ([x, y], n, flash, col) => {
+    if (flash > 0) { ctx.fillStyle = col; ctx.globalAlpha = flash * 0.45; ctx.beginPath(); ctx.roundRect(x * C + 4, y * C + 4, C - 8, C - 8, 10); ctx.fill(); ctx.globalAlpha = 1; }
+    for (let i = 0; i < Math.min(n, 3); i++) ctx.drawImage(IMG.ramenSmall, x * C + 8 + i * 14, y * C + (y === 0 ? 22 : 10) - i * 3, 26, 26);
+    if (n > 3) { ctx.fillStyle = '#FFF4D6'; ctx.font = "800 13px 'Nunito', sans-serif"; ctx.textAlign = 'right'; ctx.fillText('×' + n, x * C + C - 8, y * C + (y === 0 ? 50 : 40)); }
+  };
+  pile(a.playerBase, A.p.score, A.flashP || 0, '#7FD1E8'); if (A.r) pile(a.rivalBase, A.r.score, A.flashR || 0, A.r.def.color);
   if (A.test && A.trail.length > 1) {
     ctx.strokeStyle = 'rgba(127,209,232,.6)'; ctx.lineWidth = 3; ctx.setLineDash([2, 8]); ctx.lineCap = 'round'; ctx.beginPath();
     A.trail.forEach(([x, y], i) => i ? ctx.lineTo(x * C + C / 2, y * C + C / 2) : ctx.moveTo(x * C + C / 2, y * C + C / 2)); ctx.stroke(); ctx.setLineDash([]);
@@ -1199,7 +1213,7 @@ function arenaDraw() {
   // empty spot markers + bowls
   for (const b of A.bowls) {
     ctx.strokeStyle = 'rgba(232,128,58,.35)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(b.sx * C + C / 2, b.sy * C + C / 2, 20, 0, 7); ctx.stroke();
-    if (!b.by) ctx.drawImage(IMG.ramenSmall, b.x * C + 12, b.y * C + 12, 44, 44);
+    if (!b.by) { const s = 44 * (1 + (b.pop || 0) * 0.4); ctx.drawImage(IMG.ramenSmall, b.x * C + C / 2 - s / 2, b.y * C + C / 2 - s / 2, s, s); }
   }
   const bot = (o, col, face, carry) => {
     const x = o.rx * C + 6, y = o.ry * C + 6;
@@ -1215,6 +1229,8 @@ function arenaDraw() {
   };
   if (A.r) bot(A.r, A.r.def.color, 'rivalFace', carried('r').length);
   bot(A.p, A.boost > 0 ? '#FFC53D' : '#7FD1E8', 'botFace', carried('p').length);
+  // a loose bowl under a robot peeks out from the corner so a mid-board Drop stays visible
+  for (const b of A.bowls) if (!b.by && ((b.x === A.p.x && b.y === A.p.y) || (A.r && b.x === A.r.x && b.y === A.r.y))) ctx.drawImage(IMG.ramenSmall, b.x * C + C - 30, b.y * C + C - 28, 28, 28);
   ctx.textAlign = 'center';
   for (const f of A.fx) {
     ctx.globalAlpha = 1 - f.t; ctx.font = "800 16px 'Baloo 2', sans-serif"; ctx.lineWidth = 4; ctx.strokeStyle = '#1B1F3B';
